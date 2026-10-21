@@ -13,6 +13,8 @@ jobs:
           node-version: '20'
       - name: File length
         run: python3 scripts/check_line_limit.py
+      - name: Docs are local-only
+        run: python3 scripts/check_docs_not_tracked.py --allow-history
       - name: Build
         run: node build/build.mjs
       - name: Digest (must be reproducible)
