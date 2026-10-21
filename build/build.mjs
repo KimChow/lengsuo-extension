@@ -17,7 +17,7 @@
 // No dependencies: node >= 18 for node:crypto and node:test.
 
 import { createHash } from 'node:crypto';
-import { readdir, readFile, mkdir, copyFile, rm } from 'node:fs/promises';
+import { readdir, readFile, mkdir, copyFile } from 'node:fs/promises';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -89,6 +89,18 @@ export async function listExtensions() {
     .sort();
 }
 
+/**
+ * Make sure `dir` exists.
+ *
+ * The build overwrites files in place rather than clearing the directory
+ * first. Deleting a tree is not reliable here: a recycle-bin style shim can
+ * intercept the removal and time out. A stale file would survive a clear,
+ * so the digest is what actually proves the contents.
+ */
+async function ensureDirectory(dir) {
+  await mkdir(dir, { recursive: true });
+}
+
 async function copyTree(from, to) {
   const files = await listFiles(from);
   for (const rel of files) {
@@ -99,13 +111,19 @@ async function copyTree(from, to) {
   return files;
 }
 
-/** Build one extension into dist/<name>/. */
-export async function buildExtension(name) {
+/**
+ * Build one extension into dist/<name>/.
+ *
+ * Files are written over the previous contents. The directory is not
+ * cleared: removing a tree can be intercepted by tooling that moves it to a
+ * trash bin, which is slow and can fail. The digest is what proves what the
+ * package contains.
+ */
+export async function buildExtension(name, outRoot = DIST) {
   const src = join(EXTENSIONS_DIR, name);
-  const out = join(DIST, name);
+  const out = join(outRoot, name);
 
-  await rm(out, { recursive: true, force: true });
-  await mkdir(out, { recursive: true });
+  await ensureDirectory(out);
 
   for (const file of ROOT_FILES) {
     await copyFile(join(src, file), join(out, file));
@@ -132,8 +150,7 @@ async function main() {
     }
   }
 
-  await rm(DIST, { recursive: true, force: true });
-  await mkdir(DIST, { recursive: true });
+  await ensureDirectory(DIST);
 
   const results = [];
   for (const name of names) {

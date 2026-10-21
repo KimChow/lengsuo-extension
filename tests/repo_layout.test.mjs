@@ -4,7 +4,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, access } from 'node:fs/promises';
+import { readFile, access, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { listExtensions, buildExtension, digestDirectory } from '../build/build.mjs';
@@ -52,11 +53,17 @@ test('the manifest declares the native messaging permission', async () => {
   }
 });
 
-test('building one extension does not disturb the others', async () => {
+test('an extension builds into a package with the expected shape', async () => {
   const names = await listExtensions();
   const first = names[0];
-  const out = await buildExtension(first);
+
+  // Build into a scratch directory: the test must not remove anything from
+  // the working tree, and a scratch root keeps it out of the way.
+  const scratch = await mkdtemp(join(tmpdir(), 'lengsuo-ext-build-'));
+  const out = await buildExtension(first, scratch);
+
   const { digest, files } = await digestDirectory(out);
   assert.match(digest, /^[0-9a-f]{64}$/);
   assert.ok(files.includes('manifest.json'));
+  assert.ok(files.some((f) => f.startsWith('src/')));
 });
