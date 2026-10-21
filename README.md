@@ -11,6 +11,9 @@ extensions/
   credential/     the credential extension (Passkey, password, TOTP)
 ```
 
+> **文档不入库**：`docs/` 全部只保留在本地开发工作区（用于开发进展与验收记录），不随仓库分发，
+> 也不保留在 git 历史中。需要查阅请找开发方索取。
+
 ## What lives where
 
 | Extension | Holds |
