@@ -1,0 +1,41 @@
+name: extension-checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: File length
+        run: python3 scripts/check_line_limit.py
+      - name: Build
+        run: node build/build.mjs
+      - name: Digest (must be reproducible)
+        run: node build/build.mjs --digest
+      - name: Tests
+        run: node --test "tests/*.test.mjs" "extensions/*/tests/*.test.mjs"
+      - name: No private key in the tree
+        run: |
+          tracked=$(git ls-files)
+          if echo "$tracked" | grep -E '(_private|\.key$|\.p12$)'; then
+            echo "a private key is tracked; it must never be committed"
+            exit 1
+          fi
+          for pubkey in $(echo "$tracked" | grep 'extension_public_key.pem$'); do
+            echo "public key tracked: $pubkey"
+          done
+          if [ "$(echo "$tracked" | grep -c 'extension_public_key.pem$')" -eq 0 ]; then
+            echo "no extension public key is tracked; the extension ids would change"
+            exit 1
+          fi
+      - name: No reference implementation in the tree
+        run: |
+          if grep -ril 'bitwarden' --include='*.js' --include='*.mjs' --include='*.json' .; then
+            echo "the reference implementation is GPL-3.0 and must not appear here"
+            exit 1
+          fi

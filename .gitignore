@@ -1,0 +1,25 @@
+# ---- 构建产物 / 临时 ----
+dist/
+node_modules/
+*.tmp
+*.log
+
+# ---- 本地文档（只留本地，不进仓）----
+docs/
+
+# ---- 密钥与凭据（绝不入库）----
+# ⚠️ 固定公钥 extensions/*/keys/extension_public_key.pem 是**例外**，必须入库
+#    （扩展 ID 由它派生，改了会让已注册的 Native Messaging host 全部失效）。
+#    这里只挡私钥与临时密钥。
+#    ⚠️ 模式必须能匹配**任意深度**下的 keys/ 目录 ⇒ 用 **/ 锚定并写两段通配。
+**/keys/*.key
+**/keys/*_private*.pem
+**/keys/*.p12
+**/keys/*_secret*.pem
+*.keystore
+.env
+.env.*
+
+# ---- 智能体本地记忆与工作区状态（不入库）----
+.workbuddy/
+.claude/settings.local.json

@@ -1,0 +1,17 @@
+{
+  "name": "lengsuo-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lengsuo browser extensions: one directory per extension",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node build/build.mjs",
+    "digest": "node build/build.mjs --digest",
+    "test": "node --test \"tests/*.test.mjs\" \"extensions/*/tests/*.test.mjs\"",
+    "check": "npm run build && npm test"
+  }
+}
