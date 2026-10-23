@@ -3,10 +3,19 @@
 // It owns the channel to the local host and the policy cache. Content
 // scripts never talk to the host directly.
 
-import { connectHost, MSG, newNonce } from './native_bridge.js';
+import { BridgeError, MSG, createBridge } from './native_bridge.js';
 import { isAllowed, isStale } from './policy.js';
 
 const POLICY_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * The production port factory is wrapped in an arrow so `chrome` is only
+ * looked up when the first request is made. Importing this module in a Node
+ * test must not need a browser global.
+ */
+const bridge = createBridge({
+  connectNative: (name) => chrome.runtime.connectNative(name),
+});
 
 /** @type {{policy: object|null, fetchedAtMs: number}} */
 let policyCache = { policy: null, fetchedAtMs: 0 };
@@ -59,18 +68,22 @@ async function policyCheck(url) {
  * Forward a request to the local host.
  *
  * The host answers with a typed message. A `USE_NATIVE_RESPONSE` answer means
- * the caller should fall back to the browser's own credential handling.
+ * the caller should fall back to the browser's own credential handling, not
+ * treat the call as a failure. Anything else that is not a valid reply is a
+ * failure with the bridge's error code; payload bytes are passed through
+ * untouched.
  */
-async function hostCall(type, payload) {
-  const result = await connectHost();
-  if (!result.ok) return result;
-
-  const message = result.message;
-  if (!message || message.type === undefined) {
-    return { ok: false, reason: 'bad_host_response' };
+async function hostCall(type, payloadBytes) {
+  try {
+    const reply = await bridge.request(type, payloadBytes);
+    if (reply.type === MSG.USE_NATIVE_RESPONSE) {
+      return { ok: true, use_native: true };
+    }
+    return { ok: true, use_native: false, type: reply.type, payload: reply.payload };
+  } catch (err) {
+    if (err instanceof BridgeError) {
+      return { ok: false, reason: err.code, detail: err.detail };
+    }
+    return { ok: false, reason: 'internal', detail: String(err) };
   }
-  if (message.type === MSG.USE_NATIVE_RESPONSE) {
-    return { ok: true, use_native: true };
-  }
-  return { ok: true, use_native: false, payload: message.payload ?? null };
 }
