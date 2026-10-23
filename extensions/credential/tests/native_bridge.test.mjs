@@ -15,8 +15,9 @@ import {
   decodeFrame,
   base64Encode,
   base64Decode,
+  envelopeOf,
   encodeEnvelope,
-  decodeEnvelope,
+  frameOfEnvelope,
   createBridge,
   newNonce,
 } from '../src/background/native_bridge.js';
@@ -148,47 +149,74 @@ test('base64Decode rejects an empty string and impossible lengths', () => {
 });
 
 // ---- JSON envelope --------------------------------------------------------
+//
+// Chromium stringifies whatever JS value `postMessage` receives and parses the
+// reply before `onMessage` runs. So the JS side sends an *object* and reads an
+// *object*; the JSON text exists only on the wire.
 
 const ZERO_FRAME = fromHex('0000000000000000');
 const ZERO_ENVELOPE = '{"frame_b64":"AAAAAAAAAAA"}';
+const ZERO_VALUE = { frame_b64: 'AAAAAAAAAAA' };
 
-test('encodeEnvelope emits the exact minimal JSON shape', () => {
+test('encodeEnvelope emits the exact minimal JSON wire text', () => {
   assert.equal(encodeEnvelope(ZERO_FRAME), ZERO_ENVELOPE);
   assert.equal(encodeEnvelope(ZERO_FRAME).includes(' '), false);
 });
 
-test('decodeEnvelope returns the frame bytes', () => {
-  assert.deepEqual(decodeEnvelope(ZERO_ENVELOPE), ZERO_FRAME);
-  assert.deepEqual(decodeEnvelope('{"frame_b64":"AAAAAAAAAAA="}'), ZERO_FRAME);
+test('envelopeOf is the object form, and stringifying it is the wire text', () => {
+  assert.deepEqual(envelopeOf(ZERO_FRAME), ZERO_VALUE);
+  // This equality is the whole point: Chromium does the stringify for us.
+  assert.equal(JSON.stringify(envelopeOf(ZERO_FRAME)), ZERO_ENVELOPE);
 });
 
-test('decodeEnvelope rejects extra keys', () => {
+test('frameOfEnvelope returns the frame bytes from the parsed object', () => {
+  assert.deepEqual(frameOfEnvelope(ZERO_VALUE), ZERO_FRAME);
+  assert.deepEqual(frameOfEnvelope({ frame_b64: 'AAAAAAAAAAA=' }), ZERO_FRAME);
+});
+
+test('frameOfEnvelope rejects a string: the peer double-encoded the envelope', () => {
+  assert.throws(() => frameOfEnvelope(ZERO_ENVELOPE), (err) => err.code === 'bad_frame');
+});
+
+test('frameOfEnvelope rejects extra keys and a non-string value', () => {
   assert.throws(
-    () => decodeEnvelope('{"frame_b64":"AAAAAAAAAAA","x":1}'),
+    () => frameOfEnvelope({ frame_b64: 'AAAAAAAAAAA', x: 1 }),
     (err) => err.code === 'bad_frame',
   );
+  assert.throws(() => frameOfEnvelope({ frame_b64: 123 }), (err) => err.code === 'bad_frame');
 });
 
-test('decodeEnvelope rejects a non-string value', () => {
-  assert.throws(() => decodeEnvelope('{"frame_b64":123}'), (err) => err.code === 'bad_frame');
-});
-
-test('decodeEnvelope rejects a missing key, a non-object, and bad JSON', () => {
-  assert.throws(() => decodeEnvelope('{}'), (err) => err.code === 'bad_frame');
-  assert.throws(() => decodeEnvelope('[]'), (err) => err.code === 'bad_frame');
-  assert.throws(() => decodeEnvelope('not json'), (err) => err.code === 'bad_frame');
+test('frameOfEnvelope rejects a missing key, an array, null, and a non-plain object', () => {
+  assert.throws(() => frameOfEnvelope({}), (err) => err.code === 'bad_frame');
+  assert.throws(() => frameOfEnvelope([]), (err) => err.code === 'bad_frame');
+  assert.throws(() => frameOfEnvelope(null), (err) => err.code === 'bad_frame');
+  class Envelope {
+    constructor() {
+      this.frame_b64 = 'AAAAAAAAAAA';
+    }
+  }
+  assert.throws(() => frameOfEnvelope(new Envelope()), (err) => err.code === 'bad_frame');
 });
 
 // ---- bridge ---------------------------------------------------------------
 
+/**
+ * A fake port that behaves the way Chromium's port does, not the way a naive
+ * mock does:
+ *   - `postMessage` receives a JS value and JSON-stringifies it onto the wire
+ *   - the listener receives a parsed value, not wire text
+ */
 function fakePort() {
-  const sent = [];
+  const sent = []; // JS values handed to postMessage
+  const wire = []; // what the host reads: JSON.stringify of each value
   const messageListeners = [];
   const disconnectListeners = [];
   return {
     sent,
-    postMessage(message) {
-      sent.push(message);
+    wire,
+    postMessage(value) {
+      sent.push(value);
+      wire.push(JSON.stringify(value));
     },
     onMessage: {
       addListener(fn) {
@@ -203,8 +231,13 @@ function fakePort() {
     disconnect() {
       for (const fn of disconnectListeners) fn();
     },
-    emitMessage(message) {
-      for (const fn of messageListeners) fn(message);
+    // Raw delivery, for pinning what onMessage does with a given value.
+    emitMessage(value) {
+      for (const fn of messageListeners) fn(value);
+    },
+    // Normal reply: the host writes text; Chromium parses it before delivery.
+    reply(text) {
+      for (const fn of messageListeners) fn(JSON.parse(text));
     },
     emitDisconnect() {
       for (const fn of disconnectListeners) fn();
@@ -218,7 +251,12 @@ function replyFrame(type, payload = EMPTY) {
   return encodeEnvelope(encodeFrame(type, payload));
 }
 
-test('a request posts JSON text carrying only frame_b64 and returns one reply', async () => {
+// The same frame as the object Chromium would hand to onMessage.
+function replyValue(type, payload = EMPTY) {
+  return JSON.parse(replyFrame(type, payload));
+}
+
+test('a request posts an object carrying only frame_b64 and returns one reply', async () => {
   const port = fakePort();
   const bridge = createBridge({
     connectNative(name) {
@@ -231,15 +269,51 @@ test('a request posts JSON text carrying only frame_b64 and returns one reply', 
   await flush();
 
   assert.equal(port.sent.length, 1);
-  assert.equal(typeof port.sent[0], 'string');
-  assert.deepEqual(Object.keys(JSON.parse(port.sent[0])), ['frame_b64']);
+  // (a) an object, not an array
+  assert.equal(typeof port.sent[0], 'object');
+  assert.equal(Array.isArray(port.sent[0]), false);
+  // (c) exactly one key, a string value
+  assert.deepEqual(Object.keys(port.sent[0]), ['frame_b64']);
+  assert.equal(typeof port.sent[0].frame_b64, 'string');
 
-  // The posted text is an envelope around exactly the frame we asked for.
-  const decoded = decodeFrame(decodeEnvelope(port.sent[0]));
+  // The posted value is an envelope around exactly the frame we asked for.
+  const decoded = decodeFrame(frameOfEnvelope(port.sent[0]));
   assert.equal(decoded.type, MSG.GET_TOTP);
   assert.deepEqual(Array.from(decoded.payload), [1, 2, 3]);
 
-  port.emitMessage(replyFrame(MSG.USE_NATIVE_RESPONSE));
+  port.reply(replyFrame(MSG.USE_NATIVE_RESPONSE));
+  const result = await pending;
+  assert.equal(result.type, MSG.USE_NATIVE_RESPONSE);
+  assert.deepEqual(result.payload, EMPTY);
+});
+
+test('a type-10 empty request crosses the wire as the pinned JSON text', async () => {
+  const port = fakePort();
+  const bridge = createBridge({ connectNative: () => port });
+
+  const pending = bridge.request(MSG.USE_NATIVE_RESPONSE, EMPTY, { timeoutMs: 200 });
+  await flush();
+
+  // (b) exact wire text: Chromium's JSON.stringify of the object we posted.
+  // len=0 | type=0a | 00 00 00 -> base64 "AAAAAAoAAAA".
+  assert.equal(port.wire[0], '{"frame_b64":"AAAAAAoAAAA"}');
+
+  port.reply(port.wire[0]);
+  const result = await pending;
+  assert.equal(result.type, MSG.USE_NATIVE_RESPONSE);
+  assert.deepEqual(result.payload, EMPTY);
+});
+
+test('a reply parsed from wire text yields the frame (reverse direction)', async () => {
+  // (d) Chromium parses the host's text before onMessage; the listener must
+  // accept that object. The literal is the type-10 empty frame.
+  const port = fakePort();
+  const bridge = createBridge({ connectNative: () => port });
+
+  const pending = bridge.request(MSG.GET_TOTP, EMPTY, { timeoutMs: 200 });
+  await flush();
+
+  port.reply('{"frame_b64":"AAAAAAoAAAA"}');
   const result = await pending;
   assert.equal(result.type, MSG.USE_NATIVE_RESPONSE);
   assert.deepEqual(result.payload, EMPTY);
@@ -251,16 +325,16 @@ test('a reply after the timeout is not handed to the next request', async () => 
 
   const first = bridge.request(MSG.LIST_CREDENTIALS, EMPTY, { timeoutMs: 200 });
   await flush();
-  port.emitMessage(replyFrame(MSG.AUTH_QUERY));
+  port.reply(replyFrame(MSG.AUTH_QUERY));
   assert.equal((await first).type, MSG.AUTH_QUERY);
 
   // A second reply with nobody waiting must be dropped, not queued.
-  port.emitMessage(replyFrame(MSG.RECOVER));
+  port.reply(replyFrame(MSG.RECOVER));
   await flush();
 
   const second = bridge.request(MSG.GET_PASSWORD, EMPTY, { timeoutMs: 200 });
   await flush();
-  port.emitMessage(replyFrame(MSG.GET_PASSWORD, fromHex('07')));
+  port.reply(replyFrame(MSG.GET_PASSWORD, fromHex('07')));
   const result = await second;
 
   // Got its own answer, not the earlier stray RECOVER.
@@ -310,26 +384,38 @@ test('a missing host is reported, whether connectNative throws or returns nothin
 });
 
 test('a malformed reply is a bad_response, never an empty object', async () => {
-  for (const bad of ['not json', '{}', '{"frame_b64":"!!!"}', replyFrame(11)]) {
+  const bad = [
+    {}, // no key
+    { frame_b64: '!!!' }, // bad base64
+    { frame_b64: 'AAAAAAAAAAA', x: 1 }, // extra key
+    { frame_b64: 123 }, // non-string value
+    [], // array
+    null, // not an object
+    replyValue(11), // well-formed envelope, unknown message type
+  ];
+  for (const value of bad) {
     const port = fakePort();
     const bridge = createBridge({ connectNative: () => port });
     const pending = bridge.request(MSG.GET_TOTP, EMPTY, { timeoutMs: 200 });
     await flush();
-    port.emitMessage(bad);
+    port.emitMessage(value);
     await assert.rejects(
       pending,
       (err) => err instanceof BridgeError && err.code === 'bad_response',
-      `reply should be rejected: ${bad}`,
+      `reply should be rejected: ${JSON.stringify(value)}`,
     );
   }
 });
 
-test('a non-text reply is a bad_response', async () => {
+test('a string reply is a bad_response: Chromium delivers a parsed object', async () => {
+  // Regression anchor: the old implementation required text, so a real
+  // Chromium reply (an object) always failed. A string now means the peer
+  // put JSON inside JSON, which the host cannot read.
   const port = fakePort();
   const bridge = createBridge({ connectNative: () => port });
   const pending = bridge.request(MSG.GET_TOTP, EMPTY, { timeoutMs: 200 });
   await flush();
-  port.emitMessage({ frame_b64: 'AAAAAAAAAAA' });
+  port.emitMessage(replyFrame(MSG.USE_NATIVE_RESPONSE));
   await assert.rejects(
     pending,
     (err) => err instanceof BridgeError && err.code === 'bad_response',

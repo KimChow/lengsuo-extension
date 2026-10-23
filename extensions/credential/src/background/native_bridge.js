@@ -183,7 +183,26 @@ export function base64Decode(text) {
   return out;
 }
 
-/** The minimal JSON envelope from §5.2.1: no spaces, one key. */
+/**
+ * The envelope as a JS value: exactly what `port.postMessage` must receive.
+ *
+ * Chromium stringifies this object itself before writing the JSON line to the
+ * host (`messaging_util.cc`), so the host sees `{"frame_b64":"..."}`. Handing
+ * Chromium a *string* would instead put quotes and escapes around it.
+ */
+export function envelopeOf(frameBytes) {
+  if (!(frameBytes instanceof Uint8Array)) {
+    throw badFrame('envelope body must be a frame');
+  }
+  return { frame_b64: base64Encode(frameBytes) };
+}
+
+/**
+ * The same envelope as wire text: no spaces, one key (§5.2.1).
+ *
+ * Only for pinning the bytes the host will read; production never calls it.
+ * `JSON.stringify(envelopeOf(f))` must equal `encodeEnvelope(f)`.
+ */
 export function encodeEnvelope(frameBytes) {
   if (!(frameBytes instanceof Uint8Array)) {
     throw badFrame('envelope body must be a frame');
@@ -192,33 +211,37 @@ export function encodeEnvelope(frameBytes) {
 }
 
 /**
- * Unwrap the JSON envelope. Legality of the frame itself is judged by
- * decodeFrame; this function only checks the envelope's shape.
+ * Unwrap the envelope Chromium hands to `onMessage`.
+ *
+ * Chromium has already parsed the wire JSON into an object before the listener
+ * runs (`gin_port.cc` MessageToV8), so this validates an object, not text. A
+ * string here means the peer put JSON *inside* JSON: the host would look for
+ * `frame_b64` and find none. Legality of the frame is judged by decodeFrame.
  */
-export function decodeEnvelope(text) {
-  if (typeof text !== 'string') {
-    throw badFrame('envelope must be JSON text');
+export function frameOfEnvelope(value) {
+  if (typeof value === 'string') {
+    throw badFrame(
+      'envelope arrived as text; Chromium already parsed it, so a string means the peer implementation is wrong',
+    );
   }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw badFrame('envelope is not JSON');
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw badFrame('envelope must be an object');
   }
 
-  const keys = Object.keys(parsed);
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    throw badFrame('envelope must be a plain object');
+  }
+
+  const keys = Object.keys(value);
   if (keys.length !== 1 || keys[0] !== 'frame_b64') {
     throw badFrame('envelope must have exactly one frame_b64 key');
   }
-  if (typeof parsed.frame_b64 !== 'string') {
+  if (typeof value.frame_b64 !== 'string') {
     throw badFrame('frame_b64 must be a string');
   }
 
-  return base64Decode(parsed.frame_b64);
+  return base64Decode(value.frame_b64);
 }
 
 // ---- the channel ----------------------------------------------------------
@@ -248,10 +271,8 @@ export function createBridge({ connectNative, now = () => Date.now() } = {}) {
     current = null;
     clearTimeout(slot.timer);
     try {
-      if (typeof message !== 'string') {
-        throw new Error('reply is not JSON text');
-      }
-      slot.resolve(decodeFrame(decodeEnvelope(message)));
+      // Chromium delivers an already-parsed object, never wire text.
+      slot.resolve(decodeFrame(frameOfEnvelope(message)));
     } catch (err) {
       slot.reject(new BridgeError('bad_response', String(err && err.message ? err.message : err)));
     }
@@ -301,7 +322,8 @@ export function createBridge({ connectNative, now = () => Date.now() } = {}) {
 
       let envelope;
       try {
-        envelope = encodeEnvelope(encodeFrame(type, payloadBytes));
+        // An object, not text: Chromium stringifies whatever value it gets.
+        envelope = envelopeOf(encodeFrame(type, payloadBytes));
       } catch (err) {
         reject(err);
         return;
