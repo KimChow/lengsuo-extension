@@ -17,7 +17,7 @@
 // No dependencies: node >= 18 for node:crypto and node:test.
 
 import { createHash } from 'node:crypto';
-import { readdir, readFile, mkdir, copyFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { readdir, readFile, stat, mkdir, copyFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -117,6 +117,66 @@ export async function digestOrderingSelfCheck() {
   }
 }
 
+/**
+ * Every package-relative file reference in a parsed manifest.
+ *
+ * Globs (`*`) and external URLs (`scheme:...`) are not single files to stat.
+ * `web_accessible_resources[].matches` are page patterns, not file
+ * references, so they are skipped too.
+ */
+function manifestReferences(manifest) {
+  const refs = [];
+
+  if (manifest.background?.service_worker) {
+    refs.push(manifest.background.service_worker);
+  }
+  for (const script of manifest.content_scripts || []) {
+    refs.push(...(script.js || []));
+  }
+  for (const resource of manifest.web_accessible_resources || []) {
+    for (const item of resource.resources || []) {
+      if (!item.includes('*') && !/^[a-z][a-z0-9+.-]*:/.test(item)) {
+        refs.push(item);
+      }
+    }
+  }
+  return refs;
+}
+
+/**
+ * Build every extension into a scratch directory and prove that every file
+ * its manifest references exists at that package-relative path in the
+ * built package. The reference set comes from the built manifest; file
+ * existence is measured with stat, never inferred from the build result.
+ */
+export async function manifestReferenceSelfCheck() {
+  const names = await listExtensions();
+  const scratch = await mkdtemp(join(tmpdir(), 'lengsuo-manifest-ref-'));
+  try {
+    const missing = [];
+    for (const name of names) {
+      const out = await buildExtension(name, scratch);
+      const raw = await readFile(join(out, 'manifest.json'), 'utf8');
+      for (const ref of manifestReferences(JSON.parse(raw))) {
+        const info = await stat(join(out, ref)).catch(() => null);
+        if (!info?.isFile()) {
+          missing.push(`dist/${name}/${ref}`);
+        }
+      }
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `manifest reference self-check failed, missing or not a file:\n  ${missing.join('\n  ')}\n` +
+          'the manifest references paths relative to the package root; ' +
+          'the build must place every referenced file there',
+      );
+    }
+    process.stderr.write('manifest reference self-check: ok\n');
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 /** The extensions present in this repository, by directory name. */
 export async function listExtensions() {
   const entries = await readdir(EXTENSIONS_DIR, { withFileTypes: true });
@@ -151,6 +211,11 @@ async function copyTree(from, to) {
 /**
  * Build one extension into dist/<name>/.
  *
+ * The package is flat: src/'s contents are copied to the package root, not
+ * under a src/ subdirectory, because the manifest references its files
+ * relative to the package root. A reference with no file behind it loads
+ * nothing in the browser (manifestReferenceSelfCheck catches this).
+ *
  * Files are written over the previous contents. The directory is not
  * cleared: removing a tree can be intercepted by tooling that moves it to a
  * trash bin, which is slow and can fail. The digest is what proves what the
@@ -165,13 +230,14 @@ export async function buildExtension(name, outRoot = DIST) {
   for (const file of ROOT_FILES) {
     await copyFile(join(src, file), join(out, file));
   }
-  await copyTree(join(src, 'src'), join(out, 'src'));
+  await copyTree(join(src, 'src'), out);
 
   return out;
 }
 
 async function main() {
   await digestOrderingSelfCheck();
+  await manifestReferenceSelfCheck();
 
   const args = process.argv.slice(2);
   const wantDigest = args.includes('--digest');
