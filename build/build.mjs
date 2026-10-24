@@ -17,7 +17,8 @@
 // No dependencies: node >= 18 for node:crypto and node:test.
 
 import { createHash } from 'node:crypto';
-import { readdir, readFile, mkdir, copyFile } from 'node:fs/promises';
+import { readdir, readFile, mkdir, copyFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -51,8 +52,9 @@ export async function listFiles(dir) {
   }
 
   await walk(dir);
-  // Byte-order sort: locale-independent, so every machine agrees.
-  out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  // Byte-order sort by UTF-8 bytes (contract §5.5). NOT `a < b`: that compares
+  // UTF-16 code units, which orders astral characters differently.
+  out.sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
   return out;
 }
 
@@ -78,6 +80,41 @@ export async function digestDirectory(dir) {
   }
 
   return { digest: outer.digest('hex'), files };
+}
+
+// Hand-copied from the Rust-side vector file
+// (lengsuo-browser-package/tests/vectors/extension-digest-v1.json,
+// "astral_unicode"). Never replace it with this implementation's own output:
+// that would make the check vacuous.
+const ASTRAL_VECTOR_DIGEST =
+  '25c14558538bb11a3c3ab86e236c64816d56662f9b58134e33540551e7c2b912';
+
+/**
+ * Prove that relative paths are sorted by UTF-8 byte order, as §5.5 requires.
+ *
+ * The fixture is byte-for-byte the Rust vector's "astral_unicode" case:
+ * U+E000 ("x") and U+1F600 ("e"). UTF-16 code unit order puts the surrogate
+ * pair (U+1F600) first; UTF-8 byte order puts U+E000 first. Only the latter
+ * matches the frozen cross-repo digest.
+ */
+export async function digestOrderingSelfCheck() {
+  const dir = await mkdtemp(join(tmpdir(), 'lengsuo-digest-order-'));
+  try {
+    await writeFile(join(dir, '\uE000.txt'), 'x');
+    await writeFile(join(dir, '\u{1F600}.txt'), 'e');
+
+    const { digest } = await digestDirectory(dir);
+    if (digest !== ASTRAL_VECTOR_DIGEST) {
+      throw new Error(
+        `digest ordering self-check failed: expected ${ASTRAL_VECTOR_DIGEST}, got ${digest}\n` +
+          'relative paths must be sorted by UTF-8 byte order (contract §5.5), ' +
+          'not by UTF-16 code units',
+      );
+    }
+    process.stderr.write('digest ordering self-check: ok\n');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 /** The extensions present in this repository, by directory name. */
@@ -134,6 +171,8 @@ export async function buildExtension(name, outRoot = DIST) {
 }
 
 async function main() {
+  await digestOrderingSelfCheck();
+
   const args = process.argv.slice(2);
   const wantDigest = args.includes('--digest');
   const only = args.filter((a) => !a.startsWith('--'));
