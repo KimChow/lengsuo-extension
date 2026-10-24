@@ -1,19 +1,21 @@
-// TOTP fill: the DOM half only.
+// TOTP request pipeline (isolated world).
 //
 // The host returns the six digit code. The secret itself never leaves the
-// host process.
+// host process. No DOM access here; filling the code is a later task.
 
 (function () {
-  const CHANNEL = 'lengsuo-fido2';
+  function nonce() {
+    return crypto.getRandomValues(new Uint32Array(1))[0];
+  }
 
-  window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    const data = event.data;
-    if (!data || data.channel !== CHANNEL) return;
-
-    chrome.runtime.sendMessage({ kind: 'host_call', type: 2, payload: data.payload })
-      .then((result) => {
-        window.postMessage({ channel: CHANNEL, id: data.id, result }, '*');
+  window.__lengsuoSecret = {
+    getTotp({ ref } = {}) {
+      return chrome.runtime.sendMessage({
+        kind: 'host_call',
+        type: 2,
+        payload: { ref: ref ?? null, nonce: nonce(), origin: location.origin },
+        origin: location.origin,
       });
-  });
+    },
+  };
 })();
