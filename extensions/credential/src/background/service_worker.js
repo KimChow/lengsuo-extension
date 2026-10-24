@@ -20,20 +20,25 @@ const bridge = createBridge({
 /** @type {{policy: object|null, fetchedAtMs: number}} */
 let policyCache = { policy: null, fetchedAtMs: 0 };
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  handle(message)
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  handle(message, sender && sender.url)
     .then((result) => sendResponse(result))
     .catch((err) => sendResponse({ ok: false, reason: 'internal', detail: String(err) }));
   // Keep the channel open for the async reply.
   return true;
 });
 
-async function handle(message) {
+async function handle(message, senderUrl) {
   switch (message && message.kind) {
     case 'policy_check':
       return policyCheck(message.url);
-    case 'host_call':
+    case 'host_call': {
+      // The policy gate comes first. A denied origin must not cause a single
+      // byte to be written to the host, so hostCall is never reached below.
+      const verdict = await policyCheck(senderUrl || message.origin || '');
+      if (!verdict.allowed) return { ok: false, reason: 'policy_denied' };
       return hostCall(message.type, message.payload);
+    }
     default:
       return { ok: false, reason: 'unknown_kind' };
   }
@@ -67,15 +72,26 @@ async function policyCheck(url) {
 /**
  * Forward a request to the local host.
  *
+ * The payload is a §5.3.1 JSON object; the bridge wants bytes, so it is
+ * encoded here. Handing the object straight to `bridge.request` throws
+ * `bad_frame` and would silently disable the whole managed path.
+ *
  * The host answers with a typed message. A `USE_NATIVE_RESPONSE` answer means
  * the caller should fall back to the browser's own credential handling, not
  * treat the call as a failure. Anything else that is not a valid reply is a
  * failure with the bridge's error code; payload bytes are passed through
  * untouched.
+ *
+ * `bridgeImpl` exists so tests can inject a fake; production never passes it.
  */
-async function hostCall(type, payloadBytes) {
+async function hostCall(type, payload, bridgeImpl = bridge) {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { ok: false, reason: 'bad_payload' };
+  }
+
   try {
-    const reply = await bridge.request(type, payloadBytes);
+    const bytes = new TextEncoder().encode(JSON.stringify(payload));
+    const reply = await bridgeImpl.request(type, bytes);
     if (reply.type === MSG.USE_NATIVE_RESPONSE) {
       return { ok: true, use_native: true };
     }
@@ -87,3 +103,5 @@ async function hostCall(type, payloadBytes) {
     return { ok: false, reason: 'internal', detail: String(err) };
   }
 }
+
+export { handle, policyCheck, hostCall };
